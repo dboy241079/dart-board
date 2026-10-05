@@ -1,0 +1,40 @@
+name: Build Windows camera test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'src/**'
+      - '.github/workflows/windows-build.yml'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install vcpkg dependencies and configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Assemble portable folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/DartCameraTest.exe dist/
+          $opencvBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x64-windows/bin'
+          Get-ChildItem $opencvBin -Filter '*.dll' | Copy-Item -Destination dist/
+          Compress-Archive -Path dist/* -DestinationPath DartCameraTest-Windows-x64.zip -Force
+
+      - name: Upload portable app
+        uses: actions/upload-artifact@v4
+        with:
+          name: DartCameraTest-Windows-x64
+          path: DartCameraTest-Windows-x64.zip
+          retention-days: 14
