@@ -45,8 +45,11 @@ jobs:
           $runtimeDlls = Get-ChildItem $opencvBin -Filter '*.dll'
           if (-not $runtimeDlls) { throw "No runtime DLLs found in $opencvBin" }
           $runtimeDlls | Copy-Item -Destination dist/
-          $opencvWorld = Get-ChildItem dist -Filter 'opencv_world*.dll'
-          if (-not $opencvWorld) { throw 'opencv_world runtime DLL was not packaged.' }
+          foreach ($module in @('opencv_core*.dll', 'opencv_highgui*.dll', 'opencv_videoio*.dll')) {
+            if (-not (Get-ChildItem dist -Filter $module)) {
+              throw "Required OpenCV module DLL was not packaged: $module"
+            }
+          }
           Compress-Archive -Path dist/* -DestinationPath DartCameraTest-Windows-x64.zip -Force
 
       - name: Upload portable app
