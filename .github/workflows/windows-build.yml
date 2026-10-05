@@ -16,33 +16,22 @@ concurrency:
 jobs:
   build:
     runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Download and verify official OpenCV package
-        shell: pwsh
-        run: |
-          $url = 'https://github.com/opencv/opencv/releases/download/4.11.0/opencv-4.11.0-windows.exe'
-          Invoke-WebRequest -Uri $url -OutFile opencv-windows.exe
-          $expected = '7c9d1c0b70db1b1952cc815252fced9a07f51267563cf3eaa1674d734c49b8e4'
-          $actual = (Get-FileHash opencv-windows.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "OpenCV SHA-256 mismatch: $actual" }
-          New-Item -ItemType Directory -Force -Path opencv | Out-Null
-          7z x opencv-windows.exe "-o$PWD\opencv" -y
-          $config = Get-ChildItem opencv -Filter OpenCVConfig.cmake -Recurse | Select-Object -First 1
-          if (-not $config) { throw 'OpenCVConfig.cmake was not found in the extracted package.' }
-          $opencvDlls = @(Get-ChildItem opencv -Filter 'opencv_*.dll' -Recurse)
-          if ($opencvDlls.Count -eq 0) { throw 'OpenCV runtime DLLs were not found in the extracted package.' }
-          $opencvBin = $opencvDlls[0].Directory.FullName
-          Write-Host "OpenCV CMake config: $($config.FullName)"
-          Write-Host "OpenCV runtime DLL folder: $opencvBin"
-          Write-Host "OpenCV runtime DLLs found: $($opencvDlls.Count)"
-          "OpenCV_DIR=$($config.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "DART_OPENCV_BIN=$opencvBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Restore compiled dependency cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
 
-      - name: Configure
-        run: cmake -S . -B build -A x64 -DOpenCV_DIR="$env:OpenCV_DIR"
+      - name: Configure and install minimal OpenCV features
+        shell: pwsh
+        run: cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -52,7 +41,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item build/Release/DartCameraTest.exe dist/
-          Get-ChildItem $env:DART_OPENCV_BIN -Filter 'opencv_*.dll' | Copy-Item -Destination dist/
+          $opencvBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x64-windows/bin'
+          $runtimeDlls = Get-ChildItem $opencvBin -Filter '*.dll'
+          if (-not $runtimeDlls) { throw "No runtime DLLs found in $opencvBin" }
+          $runtimeDlls | Copy-Item -Destination dist/
+          $opencvWorld = Get-ChildItem dist -Filter 'opencv_world*.dll'
+          if (-not $opencvWorld) { throw 'opencv_world runtime DLL was not packaged.' }
           Compress-Archive -Path dist/* -DestinationPath DartCameraTest-Windows-x64.zip -Force
 
       - name: Upload portable app

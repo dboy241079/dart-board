@@ -1,5 +1,18 @@
 {
   "name": "dart-camera-test",
   "version-string": "0.1.0",
-  "dependencies": ["opencv4"]
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [
+        "highgui",
+        "dshow",
+        "msmf",
+        "jpeg",
+        "png",
+        "win32ui"
+      ]
+    }
+  ]
 }
