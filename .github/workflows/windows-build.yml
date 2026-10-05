@@ -9,6 +9,10 @@ on:
       - 'src/**'
       - '.github/workflows/windows-build.yml'
 
+concurrency:
+  group: dart-camera-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-2022
@@ -16,9 +20,25 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install vcpkg dependencies and configure
+      - name: Download and verify official OpenCV package
         shell: pwsh
-        run: cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+        run: |
+          $url = 'https://github.com/opencv/opencv/releases/download/4.11.0/opencv-4.11.0-windows.exe'
+          Invoke-WebRequest -Uri $url -OutFile opencv-windows.exe
+          $expected = '7c9d1c0b70db1b1952cc815252fced9a07f51267563cf3eaa1674d734c49b8e4'
+          $actual = (Get-FileHash opencv-windows.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "OpenCV SHA-256 mismatch: $actual" }
+          New-Item -ItemType Directory -Force -Path opencv | Out-Null
+          7z x opencv-windows.exe "-o$PWD\opencv" -y
+          $config = Get-ChildItem opencv -Filter OpenCVConfig.cmake -Recurse | Select-Object -First 1
+          if (-not $config) { throw 'OpenCVConfig.cmake was not found in the extracted package.' }
+          $opencvBin = Join-Path $config.Directory.Parent.FullName 'bin'
+          if (-not (Test-Path $opencvBin)) { throw "OpenCV runtime folder not found: $opencvBin" }
+          "OpenCV_DIR=$($config.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DART_OPENCV_BIN=$opencvBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DOpenCV_DIR="$env:OpenCV_DIR"
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -28,8 +48,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item build/Release/DartCameraTest.exe dist/
-          $opencvBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x64-windows/bin'
-          Get-ChildItem $opencvBin -Filter '*.dll' | Copy-Item -Destination dist/
+          Get-ChildItem $env:DART_OPENCV_BIN -Filter '*.dll' | Copy-Item -Destination dist/
           Compress-Archive -Path dist/* -DestinationPath DartCameraTest-Windows-x64.zip -Force
 
       - name: Upload portable app
