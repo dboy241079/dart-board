@@ -32,8 +32,12 @@ jobs:
           7z x opencv-windows.exe "-o$PWD\opencv" -y
           $config = Get-ChildItem opencv -Filter OpenCVConfig.cmake -Recurse | Select-Object -First 1
           if (-not $config) { throw 'OpenCVConfig.cmake was not found in the extracted package.' }
-          $opencvBin = Join-Path $config.Directory.Parent.FullName 'bin'
-          if (-not (Test-Path $opencvBin)) { throw "OpenCV runtime folder not found: $opencvBin" }
+          $opencvDlls = @(Get-ChildItem opencv -Filter 'opencv_*.dll' -Recurse)
+          if ($opencvDlls.Count -eq 0) { throw 'OpenCV runtime DLLs were not found in the extracted package.' }
+          $opencvBin = $opencvDlls[0].Directory.FullName
+          Write-Host "OpenCV CMake config: $($config.FullName)"
+          Write-Host "OpenCV runtime DLL folder: $opencvBin"
+          Write-Host "OpenCV runtime DLLs found: $($opencvDlls.Count)"
           "OpenCV_DIR=$($config.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
           "DART_OPENCV_BIN=$opencvBin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -48,7 +52,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item build/Release/DartCameraTest.exe dist/
-          Get-ChildItem $env:DART_OPENCV_BIN -Filter '*.dll' | Copy-Item -Destination dist/
+          Get-ChildItem $env:DART_OPENCV_BIN -Filter 'opencv_*.dll' | Copy-Item -Destination dist/
           Compress-Archive -Path dist/* -DestinationPath DartCameraTest-Windows-x64.zip -Force
 
       - name: Upload portable app
