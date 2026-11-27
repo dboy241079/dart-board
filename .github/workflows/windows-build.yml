@@ -5,7 +5,6 @@ on:
   push:
     paths:
       - 'CMakeLists.txt'
-      - 'vcpkg.json'
       - 'src/**'
       - '.github/workflows/windows-build.yml'
 
@@ -16,48 +15,76 @@ concurrency:
 jobs:
   build:
     runs-on: windows-2022
+    timeout-minutes: 20
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download and verify official OpenCV package
+      - name: Download and verify OpenCV for Windows
         shell: pwsh
         run: |
-          $url = 'https://github.com/opencv/opencv/releases/download/4.11.0/opencv-4.11.0-windows.exe'
-          Invoke-WebRequest -Uri $url -OutFile opencv-windows.exe
-          $expected = '7c9d1c0b70db1b1952cc815252fced9a07f51267563cf3eaa1674d734c49b8e4'
-          $actual = (Get-FileHash opencv-windows.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "OpenCV SHA-256 mismatch: $actual" }
-          New-Item -ItemType Directory -Force -Path opencv | Out-Null
-          7z x opencv-windows.exe "-o$PWD\opencv" -y
-          $config = Get-ChildItem opencv -Filter OpenCVConfig.cmake -Recurse | Select-Object -First 1
-          if (-not $config) { throw 'OpenCVConfig.cmake was not found in the extracted package.' }
-          $opencvDlls = @(Get-ChildItem opencv -Filter 'opencv_*.dll' -Recurse)
-          if ($opencvDlls.Count -eq 0) { throw 'OpenCV runtime DLLs were not found in the extracted package.' }
-          $opencvBin = $opencvDlls[0].Directory.FullName
-          Write-Host "OpenCV CMake config: $($config.FullName)"
-          Write-Host "OpenCV runtime DLL folder: $opencvBin"
-          Write-Host "OpenCV runtime DLLs found: $($opencvDlls.Count)"
-          "OpenCV_DIR=$($config.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "DART_OPENCV_BIN=$opencvBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $release = 'https://github.com/opencv/opencv/releases/download/4.11.0/opencv-4.11.0-windows.exe'
+          Invoke-WebRequest $release -OutFile opencv-windows.exe
+          $hash = (Get-FileHash opencv-windows.exe -Algorithm SHA256).Hash
+          if ($hash -ne '7c9d1c0b70db1b1952cc815252fced9a07f51267563cf3eaa1674d734c49b8e4') { throw 'Unexpected OpenCV download' }
+          7z x opencv-windows.exe "-o$PWD/opencv" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract OpenCV' }
+          $config = Get-ChildItem opencv -Recurse -File -Filter OpenCVConfig.cmake | Select-Object -First 1
+          if (!$config) { throw 'Missing OpenCV CMake config' }
+          "OpenCV_DIR=$($config.DirectoryName)" >> $env:GITHUB_ENV
 
-      - name: Configure
-        run: cmake -S . -B build -A x64 -DOpenCV_DIR="$env:OpenCV_DIR"
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Assemble portable folder
+      - name: Build camera application
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          cmake -S . -B build -A x64 "-DOpenCV_DIR=$env:OpenCV_DIR"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+
+      - name: Assemble x64 Windows runtime
+        shell: pwsh
+        run: |
+          New-Item -Type Directory dist | Out-Null
           Copy-Item build/Release/DartCameraTest.exe dist/
-          Get-ChildItem $env:DART_OPENCV_BIN -Filter 'opencv_*.dll' | Copy-Item -Destination dist/
-          Compress-Archive -Path dist/* -DestinationPath DartCameraTest-Windows-x64.zip -Force
+          $world = Get-ChildItem opencv -Recurse -File -Filter opencv_world4110.dll | Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (!$world) { throw 'Missing x64 opencv_world4110.dll' }
+          Copy-Item $world.FullName dist/
+          Get-ChildItem opencv -Recurse -File -Filter 'opencv_videoio_msmf*_64.dll' | ForEach-Object { Copy-Item $_.FullName dist/ -Force }
 
-      - name: Upload portable app
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $crt = Get-ChildItem (Join-Path $vs 'VC/Redist/MSVC') -Directory |
+            Where-Object { $_.Name -match '^\d+(\.\d+){2,3}$' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64/Microsoft.VC143.CRT' } |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (!$crt) { throw 'Missing Visual C++ x64 redistributables' }
+          Copy-Item (Join-Path $crt '*.dll') dist/
+          foreach ($name in @('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll')) {
+            if (!(Test-Path "dist/$name")) { throw "Missing $name" }
+          }
+          $license = Get-ChildItem opencv -Recurse -File -Filter LICENSE | Where-Object { $_.Directory.Name -eq 'sources' } | Select-Object -First 1
+          if ($license) { Copy-Item $license.FullName dist/OpenCV-LICENSE.txt }
+          Get-ChildItem dist | Select-Object Name,Length | Format-Table
+
+      - name: Verify startup from the portable folder on Windows
+        shell: pwsh
+        run: |
+          $dir = (Resolve-Path dist).Path
+          $env:PATH = "$env:SystemRoot/System32;$env:SystemRoot"
+          $process = Start-Process -FilePath (Join-Path $dir 'DartCameraTest.exe') -WorkingDirectory $dir -RedirectStandardOutput stdout.txt -RedirectStandardError stderr.txt -PassThru
+          if (!$process.WaitForExit(30000)) {
+            $process.Kill()
+            throw 'Camera probe did not finish on the runner'
+          }
+          $process.Refresh()
+          Get-Content stdout.txt,stderr.txt
+          if ($process.ExitCode -ne 1 -or !(Select-String -Path stderr.txt -SimpleMatch 'Keine Kamera' -Quiet)) {
+            throw "Application did not reach the USB camera probe (exit $($process.ExitCode))"
+          }
+
+      - name: Upload portable Windows application
         uses: actions/upload-artifact@v4
         with:
           name: DartCameraTest-Windows-x64
-          path: DartCameraTest-Windows-x64.zip
-          retention-days: 14
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
