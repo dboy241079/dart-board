@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <iomanip>
 #include <filesystem>
 #include <iostream>
@@ -20,23 +21,41 @@ struct Camera {
     std::mutex mutex;
     std::atomic<bool> running{false};
     std::thread worker;
-    double fps{};
+    std::atomic<double> fps{0.0};
     std::string backend;
 
     bool open(int deviceIndex) {
         index = deviceIndex;
-        // DirectShow is the most compatible OpenCV backend for many Windows USB webcams.
-        if (!capture.open(index, cv::CAP_DSHOW)) {
-            // Fallback in case this driver only exposes the Media Foundation backend.
-            if (!capture.open(index, cv::CAP_MSMF)) return false;
-        }
-        capture.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
-        capture.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-        capture.set(cv::CAP_PROP_FPS, 30);
-        backend = capture.getBackendName();
+        std::promise<bool> firstFrame;
+        auto ready = firstFrame.get_future();
         running = true;
-        worker = std::thread([this] {
+        worker = std::thread([this, firstFrame = std::move(firstFrame)]() mutable {
             using clock = std::chrono::steady_clock;
+            for (const int api : {cv::CAP_DSHOW, cv::CAP_MSMF}) {
+                if (!capture.open(index, api)) continue;
+                const auto name = capture.getBackendName();
+                cv::Mat first;
+                // Let the driver choose its startup format and wait for an actual image.
+                const auto deadline = clock::now() + std::chrono::seconds(2);
+                do {
+                    if (capture.read(first) && !first.empty()) break;
+                    first.release();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                } while (clock::now() < deadline);
+
+                if (!first.empty()) {
+                    frame = std::move(first);
+                    backend = name;
+                    break;
+                }
+                std::cerr << "Kameraindex " << index << " (" << name
+                          << "): Stream liefert kein Bild.\n";
+                capture.release();
+            }
+            const bool opened = !frame.empty();
+            firstFrame.set_value(opened);
+            if (!opened) return;
+
             auto windowStart = clock::now();
             int frames = 0;
             while (running) {
@@ -58,8 +77,11 @@ struct Camera {
                     windowStart = now;
                 }
             }
+            capture.release();
         });
-        return true;
+        if (ready.get()) return true;
+        close();
+        return false;
     }
 
     cv::Mat snapshot() {
@@ -70,7 +92,6 @@ struct Camera {
     void close() {
         running = false;
         if (worker.joinable()) worker.join();
-        if (capture.isOpened()) capture.release();
     }
 };
 
@@ -93,29 +114,23 @@ static void saveSnapshots(const std::vector<Camera*>& cameras) {
 }
 
 int main() {
-    std::cout << "Dart Kamera-Test – suche USB-Kameras (0 bis 9)...\n";
+    std::cout << "Dart Kamera-Test - suche USB-Kameras (0 bis 9)...\n";
     std::vector<std::unique_ptr<Camera>> found;
     for (int i = 0; i < 10 && found.size() < 3; ++i) {
         auto camera = std::make_unique<Camera>();
         if (camera->open(i)) {
-            // Allow the first frame to arrive before deciding the device is usable.
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            if (camera->snapshot().empty()) {
-                camera->close();
-                continue;
-            }
-            std::cout << "Kameraindex " << i << " geöffnet (" << camera->backend << ")\n";
+            std::cout << "Kameraindex " << i << " geoeffnet (" << camera->backend << ")\n";
             found.push_back(std::move(camera));
         }
     }
 
     if (found.empty()) {
-        std::cerr << "Keine Kamera geöffnet. Prüfe USB-Verbindung und Kamerazugriff in Windows.\n";
+        std::cerr << "Keine Kamera geoeffnet. Pruefe USB-Verbindung und Kamerazugriff in Windows.\n";
         std::cerr << "Tasten: ESC beendet, S speichert Bilder.\n";
         return 1;
     }
 
-    std::cout << found.size() << " Kamera(s) aktiv. ESC beendet, S speichert drei Beispielbilder.\n";
+    std::cout << found.size() << " Kamera(s) aktiv. ESC beendet, S speichert ein Bild pro aktiver Kamera.\n";
     std::vector<Camera*> pointers;
     for (auto& camera : found) pointers.push_back(camera.get());
 
@@ -127,7 +142,7 @@ int main() {
             std::ostringstream label;
             label << "Kamera " << (i + 1) << " | Index " << found[i]->index
                   << " | " << image.cols << "x" << image.rows
-                  << " | " << std::fixed << std::setprecision(1) << found[i]->fps << " FPS";
+                  << " | " << std::fixed << std::setprecision(1) << found[i]->fps.load() << " FPS";
             cv::putText(image, label.str(), {14, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.7,
                         {0, 255, 0}, 2, cv::LINE_AA);
             cv::imshow("Dart Kamera " + std::to_string(i + 1), image);
